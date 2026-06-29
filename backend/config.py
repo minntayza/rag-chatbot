@@ -44,8 +44,10 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dimension: int = 384
 
-    # ── Redis (optional) ──────────────────────────────────
-    redis_url: str | None = None
+    # ── Redis ──────────────────────────────────────────────
+    redis_url: str | None = "redis://localhost:6379/0"
+    redis_cache_ttl: int = 300
+    redis_enabled: bool = True
 
     # ── App ───────────────────────────────────────────────
     app_env: str = "development"
@@ -55,11 +57,18 @@ class Settings(BaseSettings):
     cors_origins: List[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173"]
     )
+    prometheus_enabled: bool = True
 
     # ── RAG ───────────────────────────────────────────────
     chunk_size: int = 500
     chunk_overlap: int = 50
     top_k_results: int = 5
+    similarity_threshold: float = 0.25
+    fallback_threshold: float = 0.15
+
+    # ── Evaluation ─────────────────────────────────────────
+    evaluation_enabled: bool = True
+    evaluation_sample_rate: float = 0.1  # evaluate 10% of queries
 
     @property
     def is_production(self) -> bool:
