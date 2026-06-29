@@ -1,19 +1,23 @@
 """
 Upload router — thin delegation layer.
 
-Receives the file, hands it to the ingestion service, and returns
-the final result. For streaming progress, see the WebSocket endpoint.
+Endpoints
+---------
+  POST   /upload                — upload and ingest a document
+  GET    /upload                — list all uploaded documents
+  DELETE /upload/{filename}     — delete all chunks for a file
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
 from db import get_supabase
 from schemas import UploadResponse
 from services.ingestion import ingest_document
-from services.retrieval import clear_retrieval_cache
+from services.cache import cache
+from services.security import check_rate_limit
 from utils.logger import logger
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
@@ -27,15 +31,19 @@ class DeleteResponse(BaseModel):
 
 # ── POST /upload ─────────────────────────────────────────────────────
 
+
 @router.post("", response_model=UploadResponse, status_code=201)
 async def upload_document(
-    file: UploadFile = File(..., description="PDF or TXT file (max 20 MB)"),
+    file: UploadFile = File(..., description="PDF, TXT, or CSV file (max 20 MB)"),
+    request: Request = None,
 ) -> UploadResponse:
     """
     Upload and ingest a document.
 
-    **Pipeline**: validate → extract → clean → split → deduplicate → embed → store.
+    **Pipeline**: validate → extract → sanitise → clean → split → deduplicate → embed → store.
     """
+    check_rate_limit(request, "upload")
+
     file_bytes = await file.read()
     filename = file.filename or "unknown"
     content_type = file.content_type or "application/octet-stream"
@@ -70,21 +78,17 @@ async def upload_document(
 
 # ── DELETE /upload/{filename} ────────────────────────────────────────
 
+
 @router.delete("/{filename:path}", response_model=DeleteResponse)
-async def delete_document(filename: str):
+async def delete_document(filename: str, request: Request):
     """
     Delete all chunks belonging to a specific filename.
-
-    Example::
-
-        DELETE /upload/company-faq.txt
-
-    Returns the filename and number of chunks deleted.
     Also clears the retrieval cache so old results aren't served.
     """
+    check_rate_limit(request, "upload")
+
     client = get_supabase()
 
-    # Count before deleting
     count_result = (
         client.table("documents")
         .select("id", count="exact")
@@ -99,11 +103,8 @@ async def delete_document(filename: str):
             detail=f"No chunks found for '{filename}'.",
         )
 
-    # Delete all chunks for this filename
     client.table("documents").delete().eq("filename", filename).execute()
-
-    # Invalidate the retrieval cache since documents changed
-    clear_retrieval_cache()
+    await cache.clear()
 
     logger.info(
         f"[upload] deleted '{filename}' — {chunk_count} chunks removed."
@@ -118,18 +119,12 @@ async def delete_document(filename: str):
 
 # ── GET /upload ──────────────────────────────────────────────────────
 
+
 @router.get("", response_model=list[dict])
-async def list_documents():
-    """
-    List all unique document filenames with chunk counts.
+async def list_documents(request: Request):
+    """List all unique document filenames with chunk counts."""
+    check_rate_limit(request, "upload")
 
-    Returns::
-
-        [
-            {"filename": "faq.pdf", "chunks": 12, "uploaded_at": "..."},
-            ...
-        ]
-    """
     client = get_supabase()
     result = (
         client.table("documents")
@@ -139,13 +134,17 @@ async def list_documents():
     )
 
     rows = result.data or []
-
-    # Aggregate by filename
     docs: dict[str, dict] = {}
     for row in rows:
         fn = row["filename"]
         if fn not in docs:
-            docs[fn] = {"filename": fn, "chunks": 0, "uploaded_at": row.get("created_at", "")}
+            docs[fn] = {
+                "filename": fn,
+                "chunks": 0,
+                "uploaded_at": row.get("created_at", ""),
+            }
         docs[fn]["chunks"] += 1
 
-    return sorted(docs.values(), key=lambda d: d.get("uploaded_at", ""), reverse=True)
+    return sorted(
+        docs.values(), key=lambda d: d.get("uploaded_at", ""), reverse=True
+    )

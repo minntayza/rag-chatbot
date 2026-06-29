@@ -31,9 +31,9 @@ from services.generation import (
 )
 from services.retrieval import (
     _merge_chunks,
-    _build_cache_key,
     ChunkResult,
 )
+from services.cache import build_retrieval_cache_key
 from services.ingestion import (
     _validate,
     _clean_text,
@@ -160,28 +160,28 @@ class TestCacheKey:
     """Cache key generation — deterministic and normalised."""
 
     def test_same_question_same_key(self):
-        k1 = _build_cache_key("What is pricing?", 5)
-        k2 = _build_cache_key("What is pricing?", 5)
+        k1 = build_retrieval_cache_key("What is pricing?", 5)
+        k2 = build_retrieval_cache_key("What is pricing?", 5)
         assert k1 == k2
 
     def test_whitespace_normalised(self):
-        k1 = _build_cache_key("what is pricing", 5)
-        k2 = _build_cache_key("  What   is   pricing  ", 5)
+        k1 = build_retrieval_cache_key("what is pricing", 5)
+        k2 = build_retrieval_cache_key("  What   is   pricing  ", 5)
         assert k1 == k2
 
     def test_case_normalised(self):
-        k1 = _build_cache_key("WHAT IS PRICING", 5)
-        k2 = _build_cache_key("what is pricing", 5)
+        k1 = build_retrieval_cache_key("WHAT IS PRICING", 5)
+        k2 = build_retrieval_cache_key("what is pricing", 5)
         assert k1 == k2
 
     def test_different_top_k_different_key(self):
-        k1 = _build_cache_key("question", 5)
-        k2 = _build_cache_key("question", 10)
+        k1 = build_retrieval_cache_key("question", 5)
+        k2 = build_retrieval_cache_key("question", 10)
         assert k1 != k2
 
     def test_different_questions_different_key(self):
-        k1 = _build_cache_key("pricing", 5)
-        k2 = _build_cache_key("shipping", 5)
+        k1 = build_retrieval_cache_key("pricing", 5)
+        k2 = build_retrieval_cache_key("shipping", 5)
         assert k1 != k2
 
 

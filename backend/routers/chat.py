@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from db import get_supabase
@@ -27,9 +27,14 @@ from schemas import (
     FeedbackRequest,
     FeedbackResponse,
 )
-from services.generation import build_prompt, generate_answer_stream, save_chat_message
+from services.generation import generate_answer_stream, save_chat_message
 from services.rag import query_rag
 from services.retrieval import RetrievalResult, retrieve_context
+from services.security import (
+    check_rate_limit,
+    sanitise_question,
+    get_security_headers,
+)
 from utils.logger import logger
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -39,17 +44,22 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 
 @router.post("", response_model=ChatResponse, status_code=201)
-async def send_message(payload: ChatRequest):
-    """
-    Accept a user question, run the full RAG pipeline, and return the answer.
+async def send_message(payload: ChatRequest, request: Request):
+    """Accept a user question, run the full RAG pipeline, and return the answer."""
+    # Rate limiting
+    check_rate_limit(request, "chat")
 
-    Non-streaming — returns the complete answer in one JSON response.
-    Use ``POST /chat/stream`` for word-by-word streaming.
-    """
+    # Sanitise question
+    sanitised, was_blocked = sanitise_question(payload.message)
+
+    if was_blocked:
+        # Refuse to process — don't even call the LLM
+        return _refuse_response(payload.session_id, payload.message)
+
     try:
         result = await query_rag(
             session_id=payload.session_id,
-            question=payload.message,
+            question=sanitised,
         )
         return ChatResponse(**result)
     except RuntimeError as exc:
@@ -61,42 +71,35 @@ async def send_message(payload: ChatRequest):
 
 
 @router.post("/stream", status_code=201)
-async def send_message_stream(payload: ChatRequest):
-    """
-    Stream the RAG answer via Server-Sent Events (SSE).
+async def send_message_stream(payload: ChatRequest, request: Request):
+    """Stream the RAG answer via Server-Sent Events (SSE)."""
+    check_rate_limit(request, "stream")
 
-    Text format::
-
-        data: {"type":"status","message":"Retrieving..."}
-        data: {"type":"token","token":"First"}
-        data: {"type":"token","token":" words..."}
-        data: {"type":"done","sources":[...],"retrieval_latency_ms":400}
-
-    The frontend can render tokens as they arrive for a
-    real-time typing effect.
-    """
     session_id = payload.session_id
     question = payload.message
 
-    # 1. Persist user message
-    save_chat_message(session_id, "user", question)
+    # Sanitise question
+    sanitised, was_blocked = sanitise_question(question)
+
+    save_chat_message(session_id, "user", sanitised)
 
     async def _event_stream():
         import json as _json
 
-        # 2. Retrieve context
+        if was_blocked:
+            yield f"data: {_json.dumps({'type': 'error', 'message': 'Request blocked by security filter.'})}\n\n"
+            return
+
         try:
-            retrieval: RetrievalResult = await retrieve_context(question)
+            retrieval: RetrievalResult = await retrieve_context(sanitised)
         except RuntimeError as exc:
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
             return
 
         yield f"data: {_json.dumps({'type': 'status', 'message': 'Retrieving context...', 'chunks_found': len(retrieval.chunks), 'retrieval_latency_ms': retrieval.latency_ms})}\n\n"
 
-        # 3. Generate stream
         if retrieval.is_empty:
             from services.rag import _has_any_documents
-
             has_docs = _has_any_documents()
             fallback = (
                 "I don't have any uploaded documents to search through. Please upload a PDF or TXT file first."
@@ -105,26 +108,21 @@ async def send_message_stream(payload: ChatRequest):
             )
             yield f"data: {_json.dumps({'type': 'token', 'token': fallback})}\n\n"
             yield f"data: {_json.dumps({'type': 'done', 'sources': [], 'retrieval_latency_ms': retrieval.latency_ms, 'fallback_used': retrieval.fallback_used})}\n\n"
-
-            # Save the fallback message
             save_chat_message(session_id, "assistant", fallback)
             return
 
         full_answer: List[str] = []
-
         try:
             async for token in generate_answer_stream(
                 context=retrieval.context,
-                question=question,
+                question=sanitised,
             ):
                 full_answer.append(token)
                 yield f"data: {_json.dumps({'type': 'token', 'token': token})}\n\n"
 
             answer = "".join(full_answer)
             yield f"data: {_json.dumps({'type': 'done', 'sources': retrieval.sources, 'retrieval_latency_ms': retrieval.latency_ms, 'fallback_used': retrieval.fallback_used})}\n\n"
-
         except RuntimeError as exc:
-            # Streaming failed — return raw context
             answer = (
                 "⚠️ The AI service is temporarily unavailable. "
                 "Here are the most relevant passages I found:\n\n"
@@ -133,7 +131,6 @@ async def send_message_stream(payload: ChatRequest):
             yield f"data: {_json.dumps({'type': 'token', 'token': answer})}\n\n"
             yield f"data: {_json.dumps({'type': 'done', 'sources': retrieval.sources, 'error': str(exc)})}\n\n"
 
-        # 4. Persist assistant response
         save_chat_message(session_id, "assistant", answer)
 
     return StreamingResponse(
@@ -142,7 +139,8 @@ async def send_message_stream(payload: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "X-Accel-Buffering": "no",
+            **get_security_headers(),
         },
     )
 
@@ -151,8 +149,10 @@ async def send_message_stream(payload: ChatRequest):
 
 
 @router.get("/{session_id}", response_model=ChatHistoryResponse)
-async def get_history(session_id: str):
+async def get_history(session_id: str, request: Request):
     """Return the full conversation history for a session."""
+    check_rate_limit(request, "chat")
+
     client = get_supabase()
     result = (
         client.table("chat_history")
@@ -165,7 +165,9 @@ async def get_history(session_id: str):
     messages = result.data or []
 
     if not messages:
-        raise HTTPException(status_code=404, detail="No history found for this session.")
+        raise HTTPException(
+            status_code=404, detail="No history found for this session."
+        )
 
     return ChatHistoryResponse(
         session_id=session_id,
@@ -177,11 +179,12 @@ async def get_history(session_id: str):
 
 
 @router.post("/feedback", response_model=FeedbackResponse, status_code=201)
-async def submit_feedback(payload: FeedbackRequest):
+async def submit_feedback(payload: FeedbackRequest, request: Request):
     """Record user feedback (thumbs up/down + optional comment)."""
+    check_rate_limit(request, "feedback")
+
     client = get_supabase()
 
-    # Verify message exists
     msg_result = (
         client.table("chat_history")
         .select("id")
@@ -209,4 +212,35 @@ async def submit_feedback(payload: FeedbackRequest):
         rating=fb.rating,
         comment=fb.comment,
         created_at=fb.created_at,
+    )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _refuse_response(session_id: str, original_preview: str) -> ChatResponse:
+    """Return a refusal when a question is blocked by the security filter."""
+    logger.warning(
+        f"[security] refused prompt injection: session={session_id} "
+        f"preview={original_preview[:200]}"
+    )
+
+    # Persist the refusal so the user sees it in history
+    msg = save_chat_message(
+        session_id,
+        "assistant",
+        "I'm unable to process this request. Please rephrase your question.",
+    )
+
+    return ChatResponse(
+        id=uuid.UUID(msg.id),
+        session_id=session_id,
+        message=msg.message,
+        sources=[],
+        retrieval_latency_ms=0,
+        generation_latency_ms=0,
+        input_tokens=0,
+        output_tokens=0,
+        fallback_used=False,
+        timestamp=msg.timestamp,
     )
