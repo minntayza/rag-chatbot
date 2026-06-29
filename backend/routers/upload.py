@@ -1,0 +1,151 @@
+"""
+Upload router — thin delegation layer.
+
+Receives the file, hands it to the ingestion service, and returns
+the final result. For streaming progress, see the WebSocket endpoint.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from db import get_supabase
+from schemas import UploadResponse
+from services.ingestion import ingest_document
+from services.retrieval import clear_retrieval_cache
+from utils.logger import logger
+
+router = APIRouter(prefix="/upload", tags=["Upload"])
+
+
+class DeleteResponse(BaseModel):
+    filename: str
+    chunks_deleted: int
+    message: str
+
+
+# ── POST /upload ─────────────────────────────────────────────────────
+
+@router.post("", response_model=UploadResponse, status_code=201)
+async def upload_document(
+    file: UploadFile = File(..., description="PDF or TXT file (max 20 MB)"),
+) -> UploadResponse:
+    """
+    Upload and ingest a document.
+
+    **Pipeline**: validate → extract → clean → split → deduplicate → embed → store.
+    """
+    file_bytes = await file.read()
+    filename = file.filename or "unknown"
+    content_type = file.content_type or "application/octet-stream"
+
+    final_detail: dict = {}
+    async for event in ingest_document(file_bytes, filename, content_type):
+        if event.stage in ("validating", "splitting", "embedding", "done"):
+            logger.info(f"[upload] {event.stage}: {event.message}")
+
+        if event.detail:
+            final_detail = event.detail
+
+        if event.stage == "error":
+            raise HTTPException(
+                status_code=422 if "extract" in event.message.lower() else 502,
+                detail=event.message,
+            )
+
+    if not final_detail:
+        raise HTTPException(status_code=500, detail="Ingestion produced no result.")
+
+    return UploadResponse(
+        filename=filename,
+        chunks_created=final_detail.get("chunks_created", 0),
+        duplicates_skipped=final_detail.get("duplicates_skipped", 0),
+        message=(
+            f"Document ingested: {final_detail.get('chunks_created', 0)} chunks created, "
+            f"{final_detail.get('duplicates_skipped', 0)} duplicates skipped."
+        ),
+    )
+
+
+# ── DELETE /upload/{filename} ────────────────────────────────────────
+
+@router.delete("/{filename:path}", response_model=DeleteResponse)
+async def delete_document(filename: str):
+    """
+    Delete all chunks belonging to a specific filename.
+
+    Example::
+
+        DELETE /upload/company-faq.txt
+
+    Returns the filename and number of chunks deleted.
+    Also clears the retrieval cache so old results aren't served.
+    """
+    client = get_supabase()
+
+    # Count before deleting
+    count_result = (
+        client.table("documents")
+        .select("id", count="exact")
+        .eq("filename", filename)
+        .execute()
+    )
+    chunk_count = count_result.count or 0
+
+    if chunk_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No chunks found for '{filename}'.",
+        )
+
+    # Delete all chunks for this filename
+    client.table("documents").delete().eq("filename", filename).execute()
+
+    # Invalidate the retrieval cache since documents changed
+    clear_retrieval_cache()
+
+    logger.info(
+        f"[upload] deleted '{filename}' — {chunk_count} chunks removed."
+    )
+
+    return DeleteResponse(
+        filename=filename,
+        chunks_deleted=chunk_count,
+        message=f"Deleted {chunk_count} chunks from '{filename}'.",
+    )
+
+
+# ── GET /upload ──────────────────────────────────────────────────────
+
+@router.get("", response_model=list[dict])
+async def list_documents():
+    """
+    List all unique document filenames with chunk counts.
+
+    Returns::
+
+        [
+            {"filename": "faq.pdf", "chunks": 12, "uploaded_at": "..."},
+            ...
+        ]
+    """
+    client = get_supabase()
+    result = (
+        client.table("documents")
+        .select("filename, created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    rows = result.data or []
+
+    # Aggregate by filename
+    docs: dict[str, dict] = {}
+    for row in rows:
+        fn = row["filename"]
+        if fn not in docs:
+            docs[fn] = {"filename": fn, "chunks": 0, "uploaded_at": row.get("created_at", "")}
+        docs[fn]["chunks"] += 1
+
+    return sorted(docs.values(), key=lambda d: d.get("uploaded_at", ""), reverse=True)

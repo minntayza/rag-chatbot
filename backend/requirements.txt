@@ -1,0 +1,27 @@
+# FastAPI & Server
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+
+# Supabase
+supabase==2.15.2
+
+# AI / RAG
+langchain==0.3.25
+langchain-community==0.3.24
+langchain-core==0.3.60
+langchain-text-splitters==0.3.8
+
+# PDF Processing
+pymupdf==1.26.0
+
+# Validation & Settings
+pydantic==2.11.3
+pydantic-settings==2.9.1
+
+# Logging
+loguru==0.7.3
+
+# Utilities
+python-dotenv==1.1.0
+httpx==0.28.1
