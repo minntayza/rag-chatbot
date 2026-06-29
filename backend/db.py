@@ -28,6 +28,10 @@ def get_supabase() -> Client:
     """
     global _supabase_client
     if _supabase_client is None:
+        # Prefer the anon JWT key — the Supabase Python SDK requires JWT format.
+        # The service_role key (sb_secret_*) is not compatible with the SDK.
+        # RLS is enforced via database policies — all tables have permissive
+        # policies since this is a server-side app with no end-user auth.
         _supabase_client = create_client(
             settings.supabase_url,
             settings.supabase_anon_key,

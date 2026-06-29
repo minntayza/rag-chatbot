@@ -31,6 +31,7 @@ Types
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io as _io
@@ -46,7 +47,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config import get_settings
 from db import get_supabase
 from services.embeddings import embed_texts
-from services.retrieval import clear_retrieval_cache
+from services.cache import cache
+from services.security import sanitise_document_text
 from utils.logger import logger
 
 settings = get_settings()
@@ -95,6 +97,28 @@ class IngestResult:
     error: Optional[str] = None
 
 
+# ── Shared helper: MIME type resolution ──────────────────────────────
+
+
+def _resolve_content_type(content_type: str, filename: str) -> str:
+    """
+    Resolve the actual content type from MIME or file extension.
+
+    Browsers sometimes send generic ``application/octet-stream`` —
+    we fall back to extension-based detection.
+    """
+    if content_type and content_type != "application/octet-stream":
+        return content_type
+
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    ext_map = {
+        "pdf": "application/pdf",
+        "txt": "text/plain",
+        "csv": "text/csv",
+    }
+    return ext_map.get(ext, content_type or "application/octet-stream")
+
+
 # ── Stage 1: Validate ────────────────────────────────────────────────
 
 
@@ -109,12 +133,7 @@ def _validate(
     Raises:
         ValueError: if the file fails validation.
     """
-    # Detect type from extension when MIME is generic
-    detected = content_type
-    if content_type == "application/octet-stream":
-        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        ext_map = {"pdf": "application/pdf", "txt": "text/plain", "csv": "text/csv"}
-        detected = ext_map.get(ext, content_type)
+    detected = _resolve_content_type(content_type, filename)
 
     if detected not in ALLOWED_MIME_TYPES:
         raise ValueError(
@@ -140,18 +159,9 @@ def _extract_text(file_bytes: bytes, content_type: str, filename: str = "") -> s
 
     - **PDF**: PyMuPDF per-page extraction, joined with double-newlines.
     - **TXT**: UTF-8 decode (fallback latin-1).
-    - **CSV**: rows converted to structured natural-language sentences
-      so the embedding model captures semantic meaning.
-
-    Returns:
-        Raw extracted text (may contain artefacts — cleaned in the next stage).
+    - **CSV**: rows converted to structured natural-language sentences.
     """
-    # Fix generic MIME via extension
-    detected = content_type
-    if content_type == "application/octet-stream" and filename:
-        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        ext_map = {"pdf": "application/pdf", "txt": "text/plain", "csv": "text/csv"}
-        detected = ext_map.get(ext, content_type)
+    detected = _resolve_content_type(content_type, filename)
 
     if detected == "application/pdf":
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -426,23 +436,8 @@ async def _find_existing_hashes(
         return set()
 
     client = get_supabase()
-
-    # Supabase `.in_()` supports at most ~100 items per call;
-    # paginate if we have more.
     existing: Set[str] = set()
-    batch_size = 100
 
-    for start in range(0, len(hashes), batch_size):
-        batch = hashes[start : start + batch_size]
-        # We don't have a content_hash column — alternative approach:
-        # Query all chunks for this filename and compare in-memory.
-        # For cross-file dedup, we query the embedding which we don't have yet.
-        # SOLUTION: query by filename only, get existing content, hash in-memory.
-        pass
-
-    # BETTER APPROACH: get all chunks for this filename, compute their hashes,
-    # and use that to determine which incoming chunks are genuinely new.
-    # Also query a few chunks from OTHER files to detect cross-file duplicates.
     all_existing = (
         client.table("documents")
         .select("id, filename, content")
@@ -479,8 +474,8 @@ async def _embed_with_retry(
     """
     Batch-embed chunks with **exponential-backoff retry**.
 
-    Calls the configured embedding backend (local model or remote API).
-    On failure, waits ``delay * 2^attempt`` seconds before retrying.
+    Uses ``asyncio.sleep`` (non-blocking) so the event loop stays free.
+    First attempt gets extra time for model download on cold start.
 
     Raises:
         RuntimeError: if all ``MAX_EMBEDDING_RETRIES`` attempts fail.
@@ -501,7 +496,7 @@ async def _embed_with_retry(
                     f"Embedding attempt {attempt}/{MAX_EMBEDDING_RETRIES} failed: {exc}. "
                     f"Retrying in {delay:.0f}s..."
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 logger.error(f"Embedding failed after {MAX_EMBEDDING_RETRIES} attempts: {exc}")
 
@@ -591,7 +586,6 @@ async def ingest_document(
         Exception:     unexpected errors during extraction or storage
     """
     start_time = time.monotonic()
-    stage_start: float
 
     try:
         # ── Stage 1: Validate ──────────────────────────────
@@ -646,6 +640,10 @@ async def ingest_document(
 
         # ── Stage 3: Clean ──────────────────────────────────
         stage_start = time.monotonic()
+
+        # Security: sanitise document text against RAG poisoning
+        raw_text = sanitise_document_text(raw_text, filename)
+
         clean_text = _clean_text(raw_text)
         cleaned_chars = len(clean_text)
         removed = char_count - cleaned_chars
@@ -782,7 +780,7 @@ async def ingest_document(
 
         # Invalidate retrieval cache so next queries see new documents
         if inserted > 0:
-            clear_retrieval_cache()
+            await cache.clear()
 
         # ── Done ─────────────────────────────────────────────
         yield ProgressEvent(

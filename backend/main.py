@@ -23,6 +23,7 @@ from db import close_db, get_supabase, init_db
 from routers import chat, upload
 from schemas import HealthResponse
 from services.cache import cache
+from services.security import get_security_headers
 from utils.logger import logger
 
 settings = get_settings()
@@ -69,14 +70,28 @@ app = FastAPI(
 
 
 # ── CORS ─────────────────────────────────────────────────────────────
+# In production, CORS_ORIGINS should be an explicit list, not wildcard.
+# The default value in config.py is ["http://localhost:3000", "http://localhost:5173"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+# ── Security headers middleware ──────────────────────────────────────
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Add security headers to every response."""
+    response = await call_next(request)
+    for header, value in get_security_headers().items():
+        response.headers.setdefault(header, value)
+    return response
 
 
 # ── Prometheus middleware ────────────────────────────────────────────
@@ -100,6 +115,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    # NEVER return raw exception text in production
     return JSONResponse(
         status_code=500,
         content={"detail": "An unexpected error occurred. Please try again later."},
@@ -128,6 +144,8 @@ async def health():
 
     Returns 200 only when DB, cache, and all services are healthy.
     Use this for Kubernetes readiness probes and load balancer health checks.
+
+    NOTE: Internal error details are NOT exposed — only up/down status.
     """
     checks: dict = {"status": "ok", "version": "1.0.0", "checks": {}}
 
@@ -135,20 +153,17 @@ async def health():
     try:
         client = get_supabase()
         client.table("documents").select("id", count="exact").limit(1).execute()
-        checks["checks"]["database"] = "healthy"
-    except Exception as exc:
-        checks["checks"]["database"] = f"unhealthy: {exc}"
+        checks["checks"]["database"] = "up"
+    except Exception:
+        checks["checks"]["database"] = "down"
         checks["status"] = "degraded"
 
     # 2. Cache check
     try:
         cache_health = await cache.health()
-        if "error" in cache_health.get("status", ""):
-            checks["checks"]["cache"] = f"degraded: {cache_health['status']}"
-        else:
-            checks["checks"]["cache"] = "healthy"
-    except Exception as exc:
-        checks["checks"]["cache"] = f"unhealthy: {exc}"
+        checks["checks"]["cache"] = "up" if "error" not in cache_health.get("status", "") else "down"
+    except Exception:
+        checks["checks"]["cache"] = "down"
 
     # 3. LLM connectivity check
     try:
@@ -158,9 +173,9 @@ async def health():
                 f"{settings.llm_base_url}/models",
                 headers={"Authorization": f"Bearer {settings.llm_api_key}"},
             )
-            checks["checks"]["llm_api"] = "healthy" if response.status_code == 200 else f"status={response.status_code}"
-    except Exception as exc:
-        checks["checks"]["llm_api"] = f"unavailable: {exc}"
+            checks["checks"]["llm_api"] = "up" if response.status_code == 200 else "down"
+    except Exception:
+        checks["checks"]["llm_api"] = "down"
 
     status_code = 200 if checks["status"] == "ok" else 503
     return JSONResponse(content=checks, status_code=status_code)

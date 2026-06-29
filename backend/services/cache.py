@@ -1,32 +1,31 @@
 """
-Redis caching service with graceful fallback.
+Unified caching service — single source of truth.
 
-Why Redis in production?
-    - Shared cache across multiple backend instances (horizontal scaling)
-    - TTL ensures stale data expires automatically
-    - Persistence (RDB/AOF) survives restarts
-    - Atomic operations prevent race conditions
-    - Built-in pub/sub for cache invalidation across instances
+Deduplicates the two previously-separate cache implementations
+(services/cache.py and services/retrieval.py's _LRUCache).
 
 Architecture
 ------------
-    Always tries Redis first. If Redis is unreachable (connection refused,
-    timeout, config disabled), falls back gracefully to in-memory LRU
-    so the application never breaks.
+    - **Redis primary** (when configured and reachable)
+    - **In-memory LRU fallback** (always available, TTL-aware)
+    - **JSON serialisation** (safe, no pickle RCE risk)
 
 Usage
 -----
     from services.cache import cache
 
-    await cache.set("key", {"data": 123}, ttl=300)
-    value = await cache.get("key")  # returns None if expired/missing
+    await cache.get("key")          # returns value or None
+    await cache.set("key", value)   # store with default TTL
+    await cache.set("key", v, 60)   # store with 60s TTL
+    await cache.delete("key")
+    await cache.clear()             # flush all
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json as _json
-import pickle
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
@@ -34,17 +33,34 @@ from typing import Any, Dict, Optional, Tuple
 import redis.asyncio as aioredis
 
 from config import get_settings
-from services.metrics import record_cache_hit, record_cache_miss
 from utils.logger import logger
 
 settings = get_settings()
+
+# ── JSON Encoder for complex types ───────────────────────────────────
+
+
+class _CacheEncoder(_json.JSONEncoder):
+    """Extends JSONEncoder to handle bytes, sets, and dataclasses."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, bytes):
+            return obj.hex()
+        if isinstance(obj, set):
+            return list(obj)
+        if hasattr(obj, "__dataclass_fields__"):
+            import dataclasses
+            return dataclasses.asdict(obj)
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return str(obj)
 
 
 # ── In-memory LRU fallback ───────────────────────────────────────────
 
 
 class _LRUFallback:
-    """Thread-safe TTL-aware in-memory cache used when Redis is down."""
+    """TTL-aware LRU cache. NOT thread-safe (single event loop)."""
 
     def __init__(self, max_size: int = 512, ttl: int = 300):
         self._store: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
@@ -77,24 +93,24 @@ class _LRUFallback:
         return len(self._store)
 
 
-# ── Redis cache ──────────────────────────────────────────────────────
+# ── Unified Cache Service ────────────────────────────────────────────
 
 
 class CacheService:
     """
-    Production cache with Redis primary + LRU fallback.
+    Single cache service used by the entire application.
 
-    Automatically detects Redis availability and degrades gracefully.
+    Auto-detects Redis availability. Falls back to in-memory LRU.
+    Uses JSON serialisation (no pickle).
     """
 
     def __init__(self):
         self._redis: Optional[aioredis.Redis] = None
-        self._fallback = _LRUFallback()
+        self._lru = _LRUFallback()
         self._redis_available: Optional[bool] = None
         self._lock = asyncio.Lock()
 
     async def _ensure_redis(self) -> Optional[aioredis.Redis]:
-        """Connect to Redis if not already connected. Thread-safe."""
         if self._redis_available is False:
             return None
         if self._redis is not None:
@@ -108,7 +124,6 @@ class CacheService:
 
             if not settings.redis_enabled or not settings.redis_url:
                 self._redis_available = False
-                logger.info("Redis disabled by config — using in-memory cache.")
                 return None
 
             try:
@@ -116,7 +131,7 @@ class CacheService:
                     settings.redis_url,
                     socket_connect_timeout=2,
                     socket_timeout=2,
-                    decode_responses=False,
+                    decode_responses=True,  # JSON is string-based
                 )
                 await self._redis.ping()
                 self._redis_available = True
@@ -125,80 +140,95 @@ class CacheService:
             except Exception as exc:
                 self._redis_available = False
                 self._redis = None
-                logger.warning(
+                logger.debug(
                     f"Redis unavailable ({exc}) — using in-memory fallback."
                 )
                 return None
 
     async def get(self, key: str) -> Optional[Any]:
-        """Get a value. Returns None on cache miss or expiration."""
         redis = await self._ensure_redis()
         if redis is not None:
             try:
                 raw = await redis.get(key)
                 if raw is None:
-                    record_cache_miss()
                     return None
-                record_cache_hit("redis")
-                return pickle.loads(raw)
+                return _json.loads(raw)
             except Exception:
                 pass
 
-        # Fallback to LRU
-        value = self._fallback.get(key)
-        if value is not None:
-            record_cache_hit("lru")
-        else:
-            record_cache_miss()
-        return value
+        return self._lru.get(key)
 
-    async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        """Set a value with optional TTL (seconds). Default: from config."""
+    async def set(
+        self, key: str, value: Any, ttl: int | None = None
+    ) -> None:
         expiry = ttl if ttl is not None else settings.redis_cache_ttl
+        serialised = _json.dumps(value, cls=_CacheEncoder)
 
         redis = await self._ensure_redis()
         if redis is not None:
             try:
-                await redis.setex(key, expiry, pickle.dumps(value))
+                await redis.setex(key, expiry, serialised)
             except Exception:
                 pass
 
-        # Always write to LRU fallback (so it's available even if Redis goes down)
-        self._fallback.set(key, value, expiry)
+        self._lru.set(key, value, expiry)
 
     async def delete(self, key: str) -> None:
-        """Delete a key from both Redis and LRU."""
         redis = await self._ensure_redis()
         if redis is not None:
             try:
                 await redis.delete(key)
             except Exception:
                 pass
-        self._fallback.delete(key)
+        self._lru.delete(key)
 
     async def clear(self) -> None:
-        """Clear all cache entries (flush Redis + LRU)."""
         redis = await self._ensure_redis()
         if redis is not None:
             try:
                 await redis.flushdb()
             except Exception:
                 pass
-        self._fallback.clear()
-        logger.info("Cache cleared (Redis + LRU)")
+        self._lru.clear()
+        logger.info("Cache cleared (Redis + LRU).")
 
     async def health(self) -> Dict[str, Any]:
-        """Check cache health. Returns status dict."""
         redis = await self._ensure_redis()
         if redis is not None:
             try:
                 await redis.ping()
-                return {"backend": "redis", "status": "healthy", "fallback_size": len(self._fallback)}
+                return {
+                    "backend": "redis",
+                    "status": "up",
+                    "lru_entries": len(self._lru),
+                }
             except Exception as exc:
-                return {"backend": "redis", "status": f"error: {exc}", "fallback_size": len(self._fallback)}
-        if self._redis_available is False:
-            return {"backend": "lru", "status": "healthy (redis unavailable)", "size": len(self._fallback)}
-        return {"backend": "unknown", "status": "not initialised"}
+                return {
+                    "backend": "redis",
+                    "status": "down",
+                    "error": str(exc),
+                    "lru_entries": len(self._lru),
+                }
+        return {
+            "backend": "lru",
+            "status": "up (redis unavailable)",
+            "lru_entries": len(self._lru),
+        }
+
+
+# ── Convenience: cache-key builder for retrieval ─────────────────────
+
+
+def build_retrieval_cache_key(question: str, top_k: int = 5) -> str:
+    """
+    Deterministic cache key for RAG retrieval results.
+
+    Normalises whitespace and case so minor variations produce the
+    same key, maximising cache hit rate.
+    """
+    normalised = " ".join(question.strip().lower().split())
+    payload = f"rag:{normalised}|k={top_k}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ── Singleton ────────────────────────────────────────────────────────
